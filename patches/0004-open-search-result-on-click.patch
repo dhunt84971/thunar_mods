@@ -1,0 +1,266 @@
+From e028e5a9ef7524550638c257bb48bd8f216fa042 Mon Sep 17 00:00:00 2001
+From: Dave <dhuntlinux@gmail.com>
+Date: Tue, 10 Nov 2026 15:56:12 -0500
+Subject: [PATCH] Open what was clicked in the search results, and stop
+ searching
+
+Clicking a folder in the search results did nothing at all on a network share:
+the view stayed on the results, the folder never opened, and the crawl carried
+on hammering the share. Two separate causes.
+
+thunar_standard_view_selection_changed() returned early for the whole duration
+of a search, one of the "row-related callbacks" disabled to speed searching up
+in 1644eb576. That dropped the selection the *user* makes by clicking a result
+just as readily as the churn it was aimed at, so the "selected-files"
+notification never reached the action manager. Activating then took the
+"nothing is selected" path in thunar_action_manager_set_selected_files(), which
+substitutes the current directory -- so Thunar dutifully re-opened the folder
+being searched, which looks exactly like nothing happening. The three remaining
+guards (rows-reordered, row-changed, select-after-row-deleted) still cover the
+per-row work that commit was really about; measured against a 1.4 TiB SMB
+share, dropping this one costs nothing: 16 results at 5s, 31 at 15s and 106 at
+45s, before and after, for the same SMB daemon CPU.
+
+Second, the crawl kept running after the activation. Poking the file goes to
+the same location the search is reading, and a gvfs mount is served by one
+backend process handling requests in turn, so the open queued up behind
+everything the search still had outstanding. Stop the search from
+thunar_action_manager_activate_selected_files() before poking -- the user has
+found what they were looking for -- keeping the results already on screen.
+thunar_list_model_stop_search() cancels the crawl, flushes what it had found
+and emits "search-done", so the view leaves search mode exactly as it does when
+a search ends by itself.
+
+With both: a single click on a result opens that folder within four seconds,
+and the share goes quiet immediately afterwards.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ FORK.md                        | 12 ++++++++++
+ thunar/thunar-action-manager.c |  9 +++++++
+ thunar/thunar-list-model.c     | 43 ++++++++++++++++++++++++++++++++++
+ thunar/thunar-list-model.h     |  2 ++
+ thunar/thunar-standard-view.c  | 33 +++++++++++++++++++++++---
+ thunar/thunar-standard-view.h  |  1 +
+ thunar/thunar-window.c         | 22 +++++++++++++++++
+ thunar/thunar-window.h         |  1 +
+ 8 files changed, 120 insertions(+), 3 deletions(-)
+
+diff --git a/FORK.md b/FORK.md
+index 0cc08214d..0970d3dfe 100644
+--- a/FORK.md
++++ b/FORK.md
+@@ -51,6 +51,18 @@ subfolders according to the existing **Include subfolders** preference
+   * Searching a 1.4 TiB SMB share for `QCAD`: nothing on screen after 45 s
+     before, 16 hits after 5 s and 106 after 45 s afterwards. See
+     `../docs/06-search-performance.md`.
++* `thunar/thunar-standard-view.c`, `thunar/thunar-window.c`,
++  `thunar/thunar-action-manager.c` — acting on a search result:
++  * `thunar_standard_view_selection_changed()` no longer ignores selection
++    changes while a search runs. Upstream dropped them all (`1644eb576`),
++    including the user's own click, so activating a result fell back to
++    "nothing selected, use the current directory" and silently re-opened the
++    folder being searched.
++  * `thunar_list_model_stop_search()` / `thunar_standard_view_stop_search()` /
++    `thunar_window_stop_search()`, called from
++    `thunar_action_manager_activate_selected_files()`: picking a result stops
++    the crawl, so the file being opened is not queued behind it. Results found
++    so far stay on screen.
+ 
+ ## What is deliberately left alone
+ 
+diff --git a/thunar/thunar-action-manager.c b/thunar/thunar-action-manager.c
+index 92120890f..a9ecf74eb 100644
+--- a/thunar/thunar-action-manager.c
++++ b/thunar/thunar-action-manager.c
+@@ -771,6 +771,15 @@ thunar_action_manager_activate_selected_files (ThunarActionManager
+ {
+   _thunar_return_if_fail (THUNAR_IS_ACTION_MANAGER (action_mgr));
+ 
++  /* The user has picked something out of the search results, so the search has
++   * served its purpose: stop it crawling before poking the file. Poking goes
++   * to the same location the search is reading, and on a slow one it would
++   * otherwise be stuck behind every request the search still has queued --
++   * clicking a folder on a network share appeared to do nothing at all. The
++   * results already found stay on screen. */
++  if (action_mgr->is_searching && THUNAR_IS_WINDOW (action_mgr->widget))
++    thunar_window_stop_search (THUNAR_WINDOW (action_mgr->widget));
++
+   thunar_action_manager_poke (action_mgr, app_info, action);
+ }
+ 
+diff --git a/thunar/thunar-list-model.c b/thunar/thunar-list-model.c
+index 8edb0d13f..bb24eef5b 100644
+--- a/thunar/thunar-list-model.c
++++ b/thunar/thunar-list-model.c
+@@ -2481,6 +2481,49 @@ thunar_list_model_cancel_search_job (ThunarListModel *model)
+ 
+ 
+ 
++/**
++ * thunar_list_model_stop_search:
++ * @store : a #ThunarListModel.
++ *
++ * Stops a recursive search which is still crawling, keeping whatever it has
++ * found so far on screen. Used when the user acts on one of the results: the
++ * crawl would otherwise go on holding the location busy, and on a slow one --
++ * a network share, where a single gvfs backend serves every request in turn --
++ * the file they asked to open would queue up behind thousands of outstanding
++ * directory reads.
++ *
++ * Does nothing if no search is running.
++ **/
++void
++thunar_list_model_stop_search (ThunarListModel *store)
++{
++  _thunar_return_if_fail (THUNAR_IS_LIST_MODEL (store));
++
++  if (store->recursive_search_job == NULL
++      && store->search_job_launch_timeout_id == 0
++      && store->update_search_results_timeout_id == 0)
++    return;
++
++  thunar_list_model_cancel_search_job (store);
++
++  if (store->update_search_results_timeout_id > 0)
++    {
++      /* show what was found before the search was stopped */
++      thunar_list_model_add_search_files (store);
++      g_source_remove (store->update_search_results_timeout_id);
++      store->update_search_results_timeout_id = 0;
++    }
++
++  g_mutex_lock (&store->mutex_files_to_add);
++  thunar_g_list_free_full (store->files_to_add);
++  store->files_to_add = NULL;
++  g_mutex_unlock (&store->mutex_files_to_add);
++
++  g_signal_emit_by_name (store, "search-done");
++}
++
++
++
+ G_NORETURN
+ static void
+ thunar_list_model_search_error (ThunarJob *job)
+diff --git a/thunar/thunar-list-model.h b/thunar/thunar-list-model.h
+index f20907f20..e6b539b28 100644
+--- a/thunar/thunar-list-model.h
++++ b/thunar/thunar-list-model.h
+@@ -75,6 +75,8 @@ GList           *thunar_list_model_get_paths_for_pattern  (ThunarListModel  *sto
+ gchar           *thunar_list_model_get_statusbar_text     (ThunarListModel  *store,
+                                                            GList            *selected_items);
+ ThunarJob       *thunar_list_model_get_job                (ThunarListModel  *store);
++void             thunar_list_model_stop_search            (ThunarListModel  *store);
++
+ void             thunar_list_model_set_job                (ThunarListModel  *store,
+                                                            ThunarJob        *job);
+ 
+diff --git a/thunar/thunar-standard-view.c b/thunar/thunar-standard-view.c
+index 0aa4c04d2..430dbd63b 100644
+--- a/thunar/thunar-standard-view.c
++++ b/thunar/thunar-standard-view.c
+@@ -4228,9 +4228,16 @@ thunar_standard_view_selection_changed (ThunarStandardView *standard_view)
+ 
+   _thunar_return_if_fail (THUNAR_IS_STANDARD_VIEW (standard_view));
+ 
+-  /* ignore while searching */
+-  if (standard_view->priv->active_search == TRUE)
+-    return;
++  /* Upstream skipped this entirely while a search was running, as one of the
++   * "row-related callbacks" disabled to speed searching up (1644eb576). That
++   * also threw away the selection the *user* makes by clicking a result: the
++   * "selected-files" notification never reached the action manager, so
++   * activating a result fell back to "nothing is selected, use the current
++   * directory" and opening a folder from the results silently re-opened the
++   * folder being searched. The remaining row-level guards (rows-reordered,
++   * row-changed, select-after-row-deleted) still cover the per-row churn this
++   * was really about; measured on a 1.4 TiB SMB share, dropping this one costs
++   * nothing. */
+ 
+   /* drop any existing "new-files" closure */
+   if (G_UNLIKELY (standard_view->priv->new_files_closure != NULL))
+@@ -4515,6 +4522,26 @@ _thunar_standard_view_open_on_middle_click (ThunarStandardView *standard_view,
+ 
+ 
+ 
++/**
++ * thunar_standard_view_stop_search:
++ * @standard_view : a #ThunarStandardView.
++ *
++ * Stops the recursive search this view is running, if any, leaving the results
++ * found so far on display. See thunar_list_model_stop_search().
++ **/
++void
++thunar_standard_view_stop_search (ThunarStandardView *standard_view)
++{
++  _thunar_return_if_fail (THUNAR_IS_STANDARD_VIEW (standard_view));
++
++  if (standard_view->model == NULL)
++    return;
++
++  thunar_list_model_stop_search (standard_view->model);
++}
++
++
++
+ /**
+  * thunar_standard_view_set_searching:
+  * @standard_view : a #ThunarStandardView.
+diff --git a/thunar/thunar-standard-view.h b/thunar/thunar-standard-view.h
+index 349dc4fec..6829cd706 100644
+--- a/thunar/thunar-standard-view.h
++++ b/thunar/thunar-standard-view.h
+@@ -191,6 +191,7 @@ void                _thunar_standard_view_open_on_middle_click (ThunarStandardVi
+                                                                 GtkTreePath              *tree_path,
+                                                                 guint                     event_state);
+ 
++void                thunar_standard_view_stop_search          (ThunarStandardView       *standard_view);
+ void                thunar_standard_view_set_searching         (ThunarStandardView       *standard_view,
+                                                                 gchar                    *search_query);
+ gchar              *thunar_standard_view_get_search_query      (ThunarStandardView       *standard_view);
+diff --git a/thunar/thunar-window.c b/thunar/thunar-window.c
+index 07a8a2427..a76e5cb42 100644
+--- a/thunar/thunar-window.c
++++ b/thunar/thunar-window.c
+@@ -3285,6 +3285,28 @@ thunar_window_resume_search (ThunarWindow *window,
+ 
+ 
+ 
++/**
++ * thunar_window_stop_search:
++ * @window : a #ThunarWindow.
++ *
++ * Stops a running recursive search without leaving search mode, so that the
++ * results stay on screen. Called when the user activates one of them: the
++ * crawl has to let go of the location first, or opening the file they picked
++ * waits behind everything the search still has outstanding.
++ **/
++void
++thunar_window_stop_search (ThunarWindow *window)
++{
++  _thunar_return_if_fail (THUNAR_IS_WINDOW (window));
++
++  if (window->is_searching == FALSE || window->view == NULL)
++    return;
++
++  thunar_standard_view_stop_search (THUNAR_STANDARD_VIEW (window->view));
++}
++
++
++
+ void
+ thunar_window_update_search (ThunarWindow *window)
+ {
+diff --git a/thunar/thunar-window.h b/thunar/thunar-window.h
+index efb98db23..5eb27ed27 100644
+--- a/thunar/thunar-window.h
++++ b/thunar/thunar-window.h
+@@ -144,6 +144,7 @@ void                      thunar_window_open_files_in_location              (Thu
+                                                                              GList               *files_to_select);
+ void                      thunar_window_show_and_select_files               (ThunarWindow        *window,
+                                                                              GList               *files_to_select);
++void                      thunar_window_stop_search                         (ThunarWindow        *window);
+ void                      thunar_window_update_search                       (ThunarWindow        *window);
+ gboolean                  thunar_window_action_cancel_search                (ThunarWindow        *window);
+ gboolean                  thunar_window_action_search                       (ThunarWindow        *window);

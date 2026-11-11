@@ -1,0 +1,62 @@
+From bcc96c1a8d599d5649d0da23b8d3e9c184e653ac Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=C4=90o=C3=A0n=20Tr=E1=BA=A7n=20C=C3=B4ng=20Danh?=
+ <congdanhqx@gmail.com>
+Date: Tue, 2 Apr 2024 12:17:16 +0700
+Subject: [PATCH] build: fix automake non standard library name
+
+Otherwise, we will run into this error:
+
+> thunar/Makefile.am:216: error: 'thunar.a' is not a standard library name
+
+(cherry picked from commit cfa85fcdb0d1ef4ecc76da98c92060b25cd4f476)
+---
+ .gitignore                        | 1 +
+ docs/reference/thunar/Makefile.am | 2 +-
+ thunar/Makefile.am                | 8 ++++----
+ 3 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index f8630f682..49781709a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -164,3 +164,4 @@ gtk-doc.m4
+ test-driver
+ m4/*
+ !m4/introspection.m4
++thunar/libthunar.a
+diff --git a/docs/reference/thunar/Makefile.am b/docs/reference/thunar/Makefile.am
+index cb0bce54e..99763ac8a 100644
+--- a/docs/reference/thunar/Makefile.am
++++ b/docs/reference/thunar/Makefile.am
+@@ -64,7 +64,7 @@ GTKDOC_CFLAGS =	 							\
+ GTKDOC_LIBS =  								\
+ 	$(GTK_LIBS)							\
+ 	$(top_builddir)/thunarx/libthunarx-$(THUNARX_VERSION_API).la	\
+-	$(top_builddir)/thunar/thunar.a					\
++	$(top_builddir)/thunar/libthunar.a				\
+ 	$(EXO_LIBS)							\
+ 	$(GIO_LIBS)							\
+ 	$(GTHREAD_LIBS)							\
+diff --git a/thunar/Makefile.am b/thunar/Makefile.am
+index ed622ec55..53b1c4677 100644
+--- a/thunar/Makefile.am
++++ b/thunar/Makefile.am
+@@ -211,9 +211,9 @@ thunar_SOURCES =							\
+ 	thunar-window.c							\
+ 	thunar-window.h
+ 
+-noinst_LIBRARIES = thunar.a
+-thunar_a_SOURCES =
+-thunar_a_LIBADD = 							\
++noinst_LIBRARIES = libthunar.a
++libthunar_a_SOURCES =
++libthunar_a_LIBADD = 							\
+ 	$(filter %.o, $(thunar_SOURCES:%.c=thunar-%.o))			\
+ 	$(wildcard $(top_builddir)/thunarx/.libs/*.o)
+ 
+@@ -348,4 +348,4 @@ EXTRA_DIST =								\
+ 	thunar.gresource.xml					\
+ 	$(desktop_in_files)
+ 
+-dist-hook: thunar.a
++dist-hook: libthunar.a

@@ -1,0 +1,332 @@
+From a5f7ae6d0b67b5d106dcccc54acacb9c7b84acd2 Mon Sep 17 00:00:00 2001
+From: Dave Hunt <dhuntlinux@gmail.com>
+Date: Tue, 10 Nov 2026 11:55:41 -0500
+Subject: [PATCH] Start a recursive search when the user types in the window
+
+Thunar only searches when the user explicitly asks for it with Ctrl+F.
+Typing a character into a view instead triggers the GTK views' own
+interactive search, which merely moves the cursor to the next matching
+name in the current folder. Nautilus starts a real (recursive) search
+right away, which is a much more useful default for a file manager.
+
+Add thunar_window_type_ahead_search(), a key-press-event handler on
+ThunarWindow which turns a plain printable keystroke into a search
+query by pushing it into the location bar's search entry. The regular
+Thunar search machinery takes it from there, so "Include subfolders"
+(misc-recursive-search) keeps deciding how deep the search goes, and
+Escape still cancels it.
+
+The handler is connected after thunar_window_location_toolbar_create(),
+so the custom action (UCA) shortcuts checked there keep their priority.
+It refuses to act on modified keys, non-printable or whitespace keys,
+keys bound to an accelerator, '/' and '~' (which open the location
+bar), and any key press that happens while a GtkEditable has the focus,
+so the location bar and the rename dialog are unaffected.
+
+The feature can be switched off with the new boolean preference
+misc-type-ahead-search, exposed as "Search as you type" in
+Preferences -> Advanced -> Search. It defaults to enabled.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ FORK.md                            |  61 +++++++++++++
+ thunar/thunar-preferences-dialog.c |  17 ++++
+ thunar/thunar-preferences.c        |  19 ++++
+ thunar/thunar-window.c             | 137 +++++++++++++++++++++++++++++
+ 4 files changed, 234 insertions(+)
+ create mode 100644 FORK.md
+
+diff --git a/FORK.md b/FORK.md
+new file mode 100644
+index 000000000..92cb9f937
+--- /dev/null
++++ b/FORK.md
+@@ -0,0 +1,61 @@
++# Fork notes — type-ahead recursive search
++
++This is a fork of **Thunar 4.18.11** (upstream tag `thunar-4.18.11`, released
++2024-07-30) carrying one feature that upstream does not have:
++
++> Typing a printable character into a focused Thunar window immediately starts a
++> search for that text, the way Nautilus/GNOME Files does it — no `Ctrl+F` first.
++
++Upstream Thunar 4.18 reacts to typing with the GTK views' *interactive search*,
++which only moves the cursor to the next matching name **in the current folder**.
++After this change, the keystroke is instead pushed into the location bar's search
++entry, which drives Thunar's regular search. That search descends into
++subfolders according to the existing **Include subfolders** preference
++(`misc-recursive-search`), so the default behaviour is a recursive search.
++
++## Branch layout
++
++| ref | meaning |
++| --- | --- |
++| `thunar-4.18.11` | pristine upstream release, the fork point |
++| `fork/4.18.11-typeahead` | this fork |
++| `origin` | `https://gitlab.xfce.org/xfce/thunar.git` |
++
++`git diff thunar-4.18.11..fork/4.18.11-typeahead` is the whole fork.
++
++## What changed
++
++* `thunar/thunar-window.c`
++  * `thunar_window_type_ahead_search()` — a `key-press-event` handler on the
++    window which converts a plain printable keystroke into a search query.
++  * `thunar_window_set_search_button_active()` — small helper to toggle the
++    search toolbar item without re-entering `thunar_window_action_search()`.
++  * the handler is connected in `thunar_window_init()` *after*
++    `thunar_window_location_toolbar_create()`, so the user-defined custom-action
++    (UCA) shortcuts registered there keep priority over plain characters.
++* `thunar/thunar-preferences.c` — new boolean preference
++  `misc-type-ahead-search` (xfconf `/misc-type-ahead-search`), default `TRUE`.
++* `thunar/thunar-preferences-dialog.c` — a **Search as you type** check box in
++  *Preferences → Advanced → Search*, above *Include subfolders*.
++
++## What is deliberately left alone
++
++The handler bails out — and the key press takes its normal course — when
++
++* the preference is off,
++* any modifier other than `Shift` is held,
++* the key does not produce a printable character (`Escape`, `Delete`, `F2`,
++  arrows, …) or produces whitespace (`Space` still toggles the selection),
++* the keystroke matches an accelerator in the window's accel group, or a Thunar
++  custom action's shortcut,
++* `/`, `~` are typed — these keep opening the location bar,
++* the keyboard focus is in a `GtkEditable`/`GtkTextView`, which covers the
++  location bar, the search entry itself and inline renaming.
++
++## Why 4.18.11 and not 4.20.x
++
++Thunar 4.20 and newer require `exo-2 >= 4.19.0`; Ubuntu 24.04 (this machine)
++ships exo 4.18.0 as part of Xfce 4.18, so 4.20 cannot be built or run here
++without replacing core Xfce libraries system-wide. 4.18.11 is the last release of
++the series that matches this desktop's library stack. See
++`../docs/01-version-selection.md`.
+diff --git a/thunar/thunar-preferences-dialog.c b/thunar/thunar-preferences-dialog.c
+index 6e330b35e..aff1d57b9 100644
+--- a/thunar/thunar-preferences-dialog.c
++++ b/thunar/thunar-preferences-dialog.c
+@@ -1148,6 +1148,23 @@ thunar_preferences_dialog_init (ThunarPreferencesDialog *dialog)
+   gtk_grid_set_column_homogeneous (GTK_GRID (grid), TRUE);
+   gtk_widget_show (grid);
+ 
++  button = gtk_check_button_new_with_mnemonic (_("Search as you _type"));
++  g_object_bind_property (G_OBJECT (dialog->preferences),
++                          "misc-type-ahead-search",
++                          G_OBJECT (button),
++                          "active",
++                          G_BINDING_BIDIRECTIONAL | G_BINDING_SYNC_CREATE);
++  gtk_widget_set_tooltip_text (button,
++                               _("Select this option to start searching as soon as you type in a Thunar window, "
++                                 "without pressing Ctrl+F first. Without it, typing jumps to the next matching "
++                                 "name in the current folder instead."));
++  gtk_widget_set_hexpand (button, TRUE);
++  gtk_grid_attach (GTK_GRID (grid), button, 0, row, 2, 1);
++  gtk_widget_show (button);
++
++  /* next row */
++  row++;
++
+   label = gtk_label_new_with_mnemonic (_("Include subfolders:"));
+   gtk_label_set_xalign (GTK_LABEL (label), 0.0f);
+   gtk_grid_attach (GTK_GRID (grid), label, 0, row, 1, 1);
+diff --git a/thunar/thunar-preferences.c b/thunar/thunar-preferences.c
+index bd2475253..fc5d99575 100644
+--- a/thunar/thunar-preferences.c
++++ b/thunar/thunar-preferences.c
+@@ -128,6 +128,7 @@ enum
+   PROP_MISC_HIGHLIGHTING_ENABLED,
+   PROP_MISC_UNDO_REDO_HISTORY_SIZE,
+   PROP_MISC_MAX_NUMBER_OF_TEMPLATES,
++  PROP_MISC_TYPE_AHEAD_SEARCH,
+   N_PROPERTIES,
+ };
+ 
+@@ -1205,6 +1206,24 @@ thunar_preferences_class_init (ThunarPreferencesClass *klass)
+                          100,
+                          EXO_PARAM_READWRITE);
+ 
++  /**
++   * ThunarPreferences:misc-type-ahead-search
++   *
++   * Whether typing a printable character while the window is focused
++   * (and no text entry has the keyboard focus) immediately starts a
++   * search for that text, instead of the interactive "jump to the next
++   * matching name in this folder" behaviour of the GTK views.
++   *
++   * How deep that search goes is controlled by
++   * ThunarPreferences:misc-recursive-search.
++   **/
++  preferences_props[PROP_MISC_TYPE_AHEAD_SEARCH] =
++      g_param_spec_boolean ("misc-type-ahead-search",
++                            "MiscTypeAheadSearch",
++                            NULL,
++                            TRUE,
++                            EXO_PARAM_READWRITE);
++
+   /* install all properties */
+   g_object_class_install_properties (gobject_class, N_PROPERTIES, preferences_props);
+ }
+diff --git a/thunar/thunar-window.c b/thunar/thunar-window.c
+index 52e4e96eb..07a8a2427 100644
+--- a/thunar/thunar-window.c
++++ b/thunar/thunar-window.c
+@@ -318,6 +318,11 @@ static void      thunar_window_menu_add_bookmarks         (ThunarWindow
+ static gboolean   thunar_window_check_uca_key_activation                 (ThunarWindow           *window,
+                                                                           GdkEventKey            *key_event,
+                                                                           gpointer                user_data);
++static gboolean   thunar_window_type_ahead_search                        (ThunarWindow           *window,
++                                                                          GdkEventKey            *key_event,
++                                                                          gpointer                user_data);
++static void       thunar_window_set_search_button_active                 (ThunarWindow           *window,
++                                                                          gboolean                active);
+ static void       thunar_window_set_directory_specific_settings          (ThunarWindow           *window,
+                                                                           gboolean                directory_specific_settings);
+ static GType      thunar_window_view_type_for_directory                  (ThunarWindow           *window,
+@@ -1001,6 +1006,11 @@ thunar_window_init (ThunarWindow *window)
+   window->location_toolbar = NULL;
+   thunar_window_location_toolbar_create (window);
+ 
++  /* Start searching as soon as the user types in the window (Nautilus-style type-ahead search).
++   * Connected after thunar_window_location_toolbar_create(), so that the UCA shortcuts which are
++   * checked there keep their priority over the plain characters consumed here. */
++  g_signal_connect (window, "key-press-event", G_CALLBACK (thunar_window_type_ahead_search), NULL);
++
+   uca_path = xfce_resource_save_location (XFCE_RESOURCE_CONFIG, "Thunar/uca.xml", TRUE);
+   window->uca_file         = g_file_new_for_path (uca_path);
+   window->uca_file_monitor = g_file_monitor_file (window->uca_file, G_FILE_MONITOR_NONE, NULL, NULL);
+@@ -4594,6 +4604,133 @@ thunar_window_check_uca_key_activation (ThunarWindow *window,
+ 
+ 
+ 
++/**
++ * thunar_window_type_ahead_search:
++ * @window     : a #ThunarWindow.
++ * @key_event  : the #GdkEventKey which triggered the callback.
++ * @user_data  : unused.
++ *
++ * Starts (or extends) a search for the typed text as soon as the user types a
++ * printable character into the window, the way Nautilus does it. The character
++ * is pushed into the search entry of the location bar, which drives the regular
++ * Thunar search; whether that search descends into subfolders is decided by the
++ * "misc-recursive-search" preference.
++ *
++ * Keys which carry a modifier, keys which do not produce a printable character,
++ * keys which are bound to an accelerator and all key presses which happen while
++ * a text entry is focused (the location bar, the search entry itself, inline
++ * renaming) are left untouched.
++ *
++ * Return value: %GDK_EVENT_STOP if the key press was consumed to search,
++ *               %GDK_EVENT_PROPAGATE otherwise.
++ **/
++static gboolean
++thunar_window_type_ahead_search (ThunarWindow *window,
++                                 GdkEventKey  *key_event,
++                                 gpointer      user_data)
++{
++  GtkWidget       *focused_widget;
++  GdkModifierType  modifiers;
++  gunichar         character;
++  gboolean         type_ahead_search;
++  gchar            buffer[8];
++  gchar           *text;
++  gint             length;
++
++  _thunar_return_val_if_fail (THUNAR_IS_WINDOW (window), GDK_EVENT_PROPAGATE);
++
++  /* the feature can be switched off in the preferences */
++  g_object_get (G_OBJECT (window->preferences), "misc-type-ahead-search", &type_ahead_search, NULL);
++  if (type_ahead_search == FALSE)
++    return GDK_EVENT_PROPAGATE;
++
++  /* there needs to be a view and a folder to search in */
++  if (window->view == NULL || window->current_directory == NULL || window->location_bar == NULL)
++    return GDK_EVENT_PROPAGATE;
++
++  /* only react on plain key presses; <Shift> is fine, since it just picks the character */
++  modifiers = key_event->state & gtk_accelerator_get_default_mod_mask ();
++  if ((modifiers & ~GDK_SHIFT_MASK) != 0)
++    return GDK_EVENT_PROPAGATE;
++
++  /* never steal key presses from a text entry: that covers the location bar, the
++   * search entry itself and the entry used for inline renaming */
++  focused_widget = gtk_window_get_focus (GTK_WINDOW (window));
++  if (focused_widget != NULL && (GTK_IS_EDITABLE (focused_widget) || GTK_IS_TEXT_VIEW (focused_widget)))
++    return GDK_EVENT_PROPAGATE;
++
++  /* only printable characters start a search, so that Escape, Delete, F2, the arrow
++   * keys and friends keep doing what they always did. Space is excluded as well,
++   * since it toggles the selection in the views */
++  character = gdk_keyval_to_unicode (key_event->keyval);
++  if (character == 0 || g_unichar_iscntrl (character) || g_unichar_isspace (character)
++      || !g_unichar_isprint (character))
++    return GDK_EVENT_PROPAGATE;
++
++  /* an accelerator bound to this very key wins over the type-ahead search */
++  if (window->accel_group != NULL
++      && gtk_accel_group_query (window->accel_group, key_event->keyval, modifiers, NULL) != NULL)
++    return GDK_EVENT_PROPAGATE;
++
++  /* '/' and '~' open the location bar instead (see thunar_standard_view_key_press_event) */
++  if (key_event->keyval == GDK_KEY_slash || key_event->keyval == GDK_KEY_asciitilde
++      || key_event->keyval == GDK_KEY_dead_tilde)
++    return GDK_EVENT_PROPAGATE;
++
++  /* the typed character, as UTF-8 */
++  length = g_unichar_to_utf8 (character, buffer);
++  buffer[length] = '\0';
++
++  if (window->is_searching == TRUE)
++    {
++      /* a search is already running, so append the character to the current query */
++      text = g_strconcat (SEARCH_PREFIX, window->search_query != NULL ? window->search_query : "", buffer, NULL);
++
++      /* the location toolbar may be hidden by the user */
++      gtk_widget_show (window->location_toolbar);
++
++      /* hand the keyboard focus back to the search entry, which drives the search */
++      thunar_location_bar_request_entry (THUNAR_LOCATION_BAR (window->location_bar), text, FALSE);
++    }
++  else
++    {
++      /* start a new search, seeded with the typed character */
++      text = g_strconcat (SEARCH_PREFIX, buffer, NULL);
++      thunar_window_start_open_location (window, text);
++      thunar_window_set_search_button_active (window, TRUE);
++    }
++
++  g_free (text);
++
++  return GDK_EVENT_STOP;
++}
++
++
++
++/**
++ * thunar_window_set_search_button_active:
++ * @window : a #ThunarWindow.
++ * @active : whether the search toolbar item should appear pressed.
++ *
++ * Updates the toggle state of the search toolbar item without re-entering
++ * thunar_window_action_search().
++ **/
++static void
++thunar_window_set_search_button_active (ThunarWindow *window,
++                                        gboolean      active)
++{
++  _thunar_return_if_fail (THUNAR_IS_WINDOW (window));
++
++  if (window->location_toolbar_item_search == NULL)
++    return;
++
++  g_signal_handlers_block_by_func (G_OBJECT (window->location_toolbar_item_search), thunar_window_action_search, window);
++  gtk_toggle_tool_button_set_active (GTK_TOGGLE_TOOL_BUTTON (window->location_toolbar_item_search), active);
++  g_signal_handlers_unblock_by_func (G_OBJECT (window->location_toolbar_item_search), thunar_window_action_search, window);
++}
++
++
++
+ static gboolean
+ thunar_window_propagate_key_event (GtkWindow* window,
+                                    GdkEvent  *key_event,

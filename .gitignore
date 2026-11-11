@@ -1,0 +1,58 @@
+# This repository carries the *changes* to Thunar — the patches, the scripts
+# that apply and build them, and the write-up. It deliberately does not carry
+# upstream's source, upstream's dependencies, or anything built from them.
+#
+#   scripts/get-upstream.sh   fetches thunar/   (clone of gitlab.xfce.org + the patches)
+#   scripts/fetch-vendor.sh   fetches vendor/   (Xfce 4.18 core library tarballs)
+#
+# Everything ignored below is reproducible from those two scripts plus
+# scripts/build.sh, so nothing of value is lost by not tracking it.
+
+# ---- upstream source ------------------------------------------------------
+# A full clone of gitlab.xfce.org/xfce/thunar.git with the fork branch on top.
+# ~150 MB, has its own .git, and is not ours to redistribute here.
+/thunar/
+
+# ---- third-party release tarballs -----------------------------------------
+# libxfce4util / libxfce4ui / exo, needed only when targeting a host still on
+# Xfce 4.16. Fetched by checksum from archive.xfce.org.
+/vendor/
+
+# ---- build and release output ---------------------------------------------
+# Out-of-tree build tree: object files, config.log and generated Makefiles,
+# all of which embed absolute paths and the build host's environment.
+/build/
+# Transfer bundles produced by scripts/make-transfer-bundle.sh.
+/dist/
+
+# ---- generic build litter -------------------------------------------------
+*.o
+*.lo
+*.la
+*.so
+*.so.*
+*.a
+.deps/
+.libs/
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+
+# ---- editor and OS noise --------------------------------------------------
+*~
+*.swp
+*.swo
+.*.sw?
+\#*\#
+.#*
+*.orig
+*.rej
+.vscode/
+.idea/
+.DS_Store
+
+# ---- local scratch --------------------------------------------------------
+# Anything parked here stays out of the repo by default.
+/scratch/
+/tmp/
+*.log

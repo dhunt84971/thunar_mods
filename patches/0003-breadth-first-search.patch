@@ -1,0 +1,408 @@
+From 8c6f3da65c0edd598be3429bf8a5d11e68fa9153 Mon Sep 17 00:00:00 2001
+From: Dave <dhuntlinux@gmail.com>
+Date: Tue, 10 Nov 2026 15:10:28 -0500
+Subject: [PATCH] Search breadth-first and report matches as they are found
+
+Recursive search descended into each subdirectory on the spot, and handed a
+folder's matches over only once the whole subtree beneath it had been walked.
+On a slow location the two together mean nothing appears for a very long time:
+the crawl disappears into the first subtree it meets, and even the matches
+sitting in the folder the user started from are withheld until everything
+below them is done.
+
+Measured against an SMB share of ~1.4 TiB over gigabit ethernet, searching for
+"QCAD" from the share root: 0 results after 45 seconds. Nautilus, which queues
+directories breadth-first and flushes hits every 500 entries, had 12 of them on
+screen within 5 seconds of the same search.
+
+Queue the subdirectories instead of recursing into them, and commit each
+folder's matches as soon as that folder has been read (and every
+THUNAR_SEARCH_COMMIT_BATCH entries within a large one). Same work, same
+attributes, same number of round trips -- only the order changes, and results
+now arrive while the crawl is still going rather than at the end of it. The
+same search now shows 16 results after 5 seconds and 106 after 45.
+
+Also delay the start of a changed search by THUNAR_SEARCH_START_DELAY. Every
+character typed into the search entry emits "changed", which replaces the
+running job, so a four-letter query used to start and abandon four crawls, each
+one losing everything the last had found. Nautilus has the same guard in
+CREATE_THREAD_DELAY_MS.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ FORK.md                    |  16 ++-
+ thunar/thunar-list-model.c | 250 ++++++++++++++++++++++++++-----------
+ 2 files changed, 195 insertions(+), 71 deletions(-)
+
+diff --git a/FORK.md b/FORK.md
+index 92cb9f937..0cc08214d 100644
+--- a/FORK.md
++++ b/FORK.md
+@@ -1,7 +1,8 @@
+ # Fork notes — type-ahead recursive search
+ 
+ This is a fork of **Thunar 4.18.11** (upstream tag `thunar-4.18.11`, released
+-2024-07-30) carrying one feature that upstream does not have:
++2024-07-30) carrying one feature that upstream does not have, plus a fix to
++the search it depends on:
+ 
+ > Typing a printable character into a focused Thunar window immediately starts a
+ > search for that text, the way Nautilus/GNOME Files does it — no `Ctrl+F` first.
+@@ -37,6 +38,19 @@ subfolders according to the existing **Include subfolders** preference
+   `misc-type-ahead-search` (xfconf `/misc-type-ahead-search`), default `TRUE`.
+ * `thunar/thunar-preferences-dialog.c` — a **Search as you type** check box in
+   *Preferences → Advanced → Search*, above *Include subfolders*.
++* `thunar/thunar-list-model.c` — recursive search made usable on slow
++  locations, which matters a great deal once typing starts one by itself:
++  * `thunar_list_model_search_folder()` walks the tree breadth-first through a
++    `GQueue` instead of recursing into each subdirectory inline, and commits
++    each folder's matches as soon as that folder has been read rather than
++    after its whole subtree — previously the matches in the folder you started
++    from were delivered last of all.
++  * `thunar_list_model_launch_search_job()` — a changed query waits
++    `THUNAR_SEARCH_START_DELAY` (250 ms) before crawling, so typing a word
++    starts one search instead of one per character.
++  * Searching a 1.4 TiB SMB share for `QCAD`: nothing on screen after 45 s
++    before, 16 hits after 5 s and 106 after 45 s afterwards. See
++    `../docs/06-search-performance.md`.
+ 
+ ## What is deliberately left alone
+ 
+diff --git a/thunar/thunar-list-model.c b/thunar/thunar-list-model.c
+index 19c36b80b..8edb0d13f 100644
+--- a/thunar/thunar-list-model.c
++++ b/thunar/thunar-list-model.c
+@@ -43,6 +43,19 @@
+ #include <thunar/thunar-simple-job.h>
+ #include <thunar/thunar-util.h>
+ 
++/* Delay between the search query changing and its crawl actually starting.
++ * Typing a word fires one "changed" per character, and each one replaces the
++ * running search, so without this a four-letter query starts and throws away
++ * four crawls. Nautilus does the same thing with CREATE_THREAD_DELAY_MS. */
++#define THUNAR_SEARCH_START_DELAY 250
++
++/* how often the matches found so far are inserted into the model */
++#define THUNAR_SEARCH_UPDATE_INTERVAL 500
++
++/* commit matches while still inside one directory, every this many entries */
++#define THUNAR_SEARCH_COMMIT_BATCH 500
++
++
+ 
+ 
+ /* Property identifiers */
+@@ -236,6 +249,9 @@ static void               thunar_list_model_search_error                (ThunarJ
+ static void               thunar_list_model_search_finished             (ThunarJob                    *job,
+                                                                          ThunarListModel              *store);
+ static gboolean           thunar_list_model_add_search_files            (gpointer user_data);
++static gboolean           thunar_list_model_launch_search_job           (gpointer user_data);
++static void               thunar_list_model_search_commit               (ThunarListModel              *model,
++                                                                         GList                       **files_found);
+ 
+ static gint               thunar_list_model_get_folder_item_count       (ThunarListModel              *store);
+ static void               thunar_list_model_set_folder_item_count       (ThunarListModel              *store,
+@@ -309,6 +325,10 @@ struct _ThunarListModel
+ 
+   /* used to stop the periodic call to thunar_list_model_add_search_files when the search is finished/canceled */
+   guint          update_search_results_timeout_id;
++
++  /* set while a changed search query is waiting out THUNAR_SEARCH_START_DELAY,
++   * before its job is actually launched */
++  guint          search_job_launch_timeout_id;
+ };
+ 
+ 
+@@ -2251,6 +2271,57 @@ thunar_list_model_set_job (ThunarListModel  *store,
+ 
+ 
+ 
++/**
++ * thunar_list_model_search_commit:
++ * @model       : a #ThunarListModel.
++ * @files_found : list of #ThunarFile<!---->s found so far; emptied here.
++ *
++ * Makes the matches found so far visible to the next
++ * thunar_list_model_add_search_files() run.
++ **/
++static void
++thunar_list_model_search_commit (ThunarListModel  *model,
++                                 GList           **files_found)
++{
++  if (*files_found == NULL)
++    return;
++
++  g_mutex_lock (&model->mutex_files_to_add);
++  model->files_to_add = g_list_concat (model->files_to_add, *files_found);
++  g_mutex_unlock (&model->mutex_files_to_add);
++
++  *files_found = NULL;
++}
++
++
++
++/**
++ * thunar_list_model_launch_search_job:
++ * @user_data : a #ThunarListModel.
++ *
++ * Starts the search job prepared by thunar_list_model_set_folder(), once the
++ * query has been left alone for THUNAR_SEARCH_START_DELAY.
++ **/
++static gboolean
++thunar_list_model_launch_search_job (gpointer user_data)
++{
++  ThunarListModel *store = THUNAR_LIST_MODEL (user_data);
++
++  store->search_job_launch_timeout_id = 0;
++
++  if (store->recursive_search_job == NULL)
++    return G_SOURCE_REMOVE;
++
++  exo_job_launch (EXO_JOB (store->recursive_search_job));
++
++  /* add new results to the model every X ms */
++  store->update_search_results_timeout_id = g_timeout_add (THUNAR_SEARCH_UPDATE_INTERVAL, thunar_list_model_add_search_files, store);
++
++  return G_SOURCE_REMOVE;
++}
++
++
++
+ static gboolean
+ thunar_list_model_add_search_files (gpointer user_data)
+ {
+@@ -2390,6 +2461,13 @@ thunar_list_model_job_search_directory (ThunarListModel *model,
+ static void
+ thunar_list_model_cancel_search_job (ThunarListModel *model)
+ {
++  /* drop a search which was prepared but has not started crawling yet */
++  if (model->search_job_launch_timeout_id > 0)
++    {
++      g_source_remove (model->search_job_launch_timeout_id);
++      model->search_job_launch_timeout_id = 0;
++    }
++
+   /* cancel the ongoing search if there is one */
+   if (model->recursive_search_job)
+     {
+@@ -2446,17 +2524,11 @@ thunar_list_model_search_folder (ThunarListModel           *model,
+                                  enum ThunarListModelSearch search_type,
+                                  gboolean                   show_hidden)
+ {
+-  GCancellable    *cancellable;
+-  GFileEnumerator *enumerator;
+-  GFile           *directory;
+-  GList           *files_found = NULL; /* contains the matching files in this folder only */
+-  const gchar     *namespace;
+-  const gchar     *display_name;
+-  gchar           *display_name_c; /* converted to ignore case */
++  GCancellable *cancellable;
++  GQueue       *directories;
++  const gchar  *namespace;
+ 
+   cancellable = exo_job_get_cancellable (EXO_JOB (job));
+-  directory = g_file_new_for_uri (uri);
+-  g_free (uri);
+   namespace = G_FILE_ATTRIBUTE_STANDARD_TYPE ","
+               G_FILE_ATTRIBUTE_STANDARD_TARGET_URI ","
+               G_FILE_ATTRIBUTE_STANDARD_DISPLAY_NAME ","
+@@ -2464,83 +2536,121 @@ thunar_list_model_search_folder (ThunarListModel           *model,
+               G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN ","
+               G_FILE_ATTRIBUTE_STANDARD_NAME ", recent::*";
+ 
+-  /* The directory enumerator MUST NOT follow symlinks itself, meaning that any symlinks that
+-   * g_file_enumerator_next_file() emits are the actual symlink entries. This prevents one
+-   * possible source of infinitely deep recursion.
++  /* The traversal is breadth-first: subdirectories are appended to a queue
++   * instead of being descended into on the spot. Depth-first recursion dives
++   * into the first subtree it meets and can take minutes to come back up,
++   * during which nothing from the folders next to it is reported -- very
++   * noticeable on a slow or high-latency location such as a network share,
++   * where the matches a user is actually looking for are usually near the top.
++   * Nautilus queues directories the same way (nautilus-search-engine-simple.c).
+    *
+-   * There is otherwise no special handling of entries in the folder which are symlinks,
+-   * which allows them to appear in the search results. */
+-  enumerator = g_file_enumerate_children (directory, namespace, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, NULL);
+-  if (enumerator == NULL)
+-    return;
++   * The queue holds owned URI strings; @uri is consumed here as well. */
++  directories = g_queue_new ();
++  g_queue_push_tail (directories, uri);
+ 
+-  /* go through every file in the folder and check if it matches */
+   while (exo_job_is_cancelled (EXO_JOB (job)) == FALSE)
+     {
+-      GFile     *file;
+-      GFileInfo *info;
+-      GFileType  type;
+-
+-      /* get GFile and GFileInfo */
+-      info = g_file_enumerator_next_file (enumerator, cancellable, NULL);
+-      if (G_UNLIKELY (info == NULL))
++      GFileEnumerator *enumerator;
++      GFile           *directory;
++      GList           *files_found = NULL; /* contains the matching files in this folder only */
++      gchar           *directory_uri;
++      const gchar     *display_name;
++      gchar           *display_name_c;     /* converted to ignore case */
++      guint            n_processed = 0;
++
++      directory_uri = g_queue_pop_head (directories);
++      if (directory_uri == NULL)
+         break;
+ 
+-      if (g_file_has_uri_scheme (directory, "recent"))
++      directory = g_file_new_for_uri (directory_uri);
++      g_free (directory_uri);
++
++      /* The directory enumerator MUST NOT follow symlinks itself, meaning that any symlinks that
++       * g_file_enumerator_next_file() emits are the actual symlink entries. This prevents one
++       * possible source of infinitely deep recursion.
++       *
++       * There is otherwise no special handling of entries in the folder which are symlinks,
++       * which allows them to appear in the search results. */
++      enumerator = g_file_enumerate_children (directory, namespace, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, NULL);
++      if (enumerator == NULL)
+         {
+-          file = g_file_new_for_uri (g_file_info_get_attribute_string (info, G_FILE_ATTRIBUTE_STANDARD_TARGET_URI));
+-          g_object_unref (info);
+-          info = g_file_query_info (file, namespace, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, NULL);
+-          if (G_UNLIKELY (info == NULL))
+-            break;
++          g_object_unref (directory);
++          continue;
+         }
+-      else
+-        file = g_file_get_child (directory, g_file_info_get_name (info));
+ 
+-      /* respect last-show-hidden */
+-      if (show_hidden == FALSE)
++      /* go through every file in the folder and check if it matches */
++      while (exo_job_is_cancelled (EXO_JOB (job)) == FALSE)
+         {
+-          /* same logic as thunar_file_is_hidden() */
+-          if (g_file_info_get_attribute_boolean (info, G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN)
+-              || g_file_info_get_attribute_boolean (info, G_FILE_ATTRIBUTE_STANDARD_IS_BACKUP))
++          GFile     *file;
++          GFileInfo *info;
++          GFileType  type;
++
++          /* get GFile and GFileInfo */
++          info = g_file_enumerator_next_file (enumerator, cancellable, NULL);
++          if (G_UNLIKELY (info == NULL))
++            break;
++
++          if (g_file_has_uri_scheme (directory, "recent"))
+             {
+-              g_object_unref (file);
++              file = g_file_new_for_uri (g_file_info_get_attribute_string (info, G_FILE_ATTRIBUTE_STANDARD_TARGET_URI));
+               g_object_unref (info);
+-              continue;
++              info = g_file_query_info (file, namespace, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, NULL);
++              if (G_UNLIKELY (info == NULL))
++                break;
+             }
+-        }
++          else
++            file = g_file_get_child (directory, g_file_info_get_name (info));
+ 
+-      type = g_file_info_get_file_type (info);
++          /* respect last-show-hidden */
++          if (show_hidden == FALSE)
++            {
++              /* same logic as thunar_file_is_hidden() */
++              if (g_file_info_get_attribute_boolean (info, G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN)
++                  || g_file_info_get_attribute_boolean (info, G_FILE_ATTRIBUTE_STANDARD_IS_BACKUP))
++                {
++                  g_object_unref (file);
++                  g_object_unref (info);
++                  continue;
++                }
++            }
+ 
+-      /* handle directories */
+-      if (type == G_FILE_TYPE_DIRECTORY && search_type == THUNAR_LIST_MODEL_SEARCH_RECURSIVE)
+-        {
+-          thunar_list_model_search_folder (model, job, g_file_get_uri (file), search_query_c_terms, search_type, show_hidden);
+-        }
++          type = g_file_info_get_file_type (info);
+ 
+-      /* prepare entry display name */
+-      display_name = g_file_info_get_display_name (info);
+-      display_name_c = thunar_g_utf8_normalize_for_search (display_name, TRUE, TRUE);
++          /* queue directories up for later instead of recursing into them now */
++          if (type == G_FILE_TYPE_DIRECTORY && search_type == THUNAR_LIST_MODEL_SEARCH_RECURSIVE)
++            g_queue_push_tail (directories, g_file_get_uri (file));
+ 
+-      /* search for all substrings */
+-      if (thunar_list_model_search_terms_match (search_query_c_terms, display_name_c))
+-        files_found = g_list_prepend (files_found, thunar_file_get (file, NULL));
++          /* prepare entry display name */
++          display_name = g_file_info_get_display_name (info);
++          display_name_c = thunar_g_utf8_normalize_for_search (display_name, TRUE, TRUE);
+ 
+-      /* free memory */
+-      g_free (display_name_c);
+-      g_object_unref (file);
+-      g_object_unref (info);
+-    }
++          /* search for all substrings */
++          if (thunar_list_model_search_terms_match (search_query_c_terms, display_name_c))
++            files_found = g_list_prepend (files_found, thunar_file_get (file, NULL));
++
++          /* free memory */
++          g_free (display_name_c);
++          g_object_unref (file);
++          g_object_unref (info);
+ 
+-  g_object_unref (enumerator);
+-  g_object_unref (directory);
++          /* don't sit on the results of a very large directory until it ends */
++          if (++n_processed % THUNAR_SEARCH_COMMIT_BATCH == 0)
++            thunar_list_model_search_commit (model, &files_found);
++        }
+ 
+-  if (exo_job_is_cancelled (EXO_JOB (job)))
+-    return;
++      g_object_unref (enumerator);
++      g_object_unref (directory);
+ 
+-  g_mutex_lock (&model->mutex_files_to_add);
+-  model->files_to_add = g_list_concat (model->files_to_add, files_found);
+-  g_mutex_unlock (&model->mutex_files_to_add);
++      /* Hand this folder's matches over right away. Committing them only once
++       * the whole subtree below it is done -- which is what recursing inline
++       * amounted to -- meant the top folder's hits appeared last of all. */
++      if (exo_job_is_cancelled (EXO_JOB (job)) == FALSE)
++        thunar_list_model_search_commit (model, &files_found);
++      else
++        thunar_g_list_free_full (files_found);
++    }
++
++  g_queue_free_full (directories, g_free);
+ }
+ 
+ 
+@@ -2668,16 +2778,16 @@ thunar_list_model_set_folder (ThunarListModel *store,
+           store->search_terms = thunar_list_model_split_search_query (search_query_c, NULL);
+           if (store->search_terms != NULL)
+             {
+-              /* search the current folder
+-               * start a new recursive_search_job */
++              /* search the current folder: prepare a new recursive_search_job,
++               * but leave the launching to thunar_list_model_launch_search_job()
++               * a moment later, so that a query still being typed is crawled
++               * once rather than once per character */
+               store->recursive_search_job = thunar_list_model_job_search_directory (store, search_query_c, thunar_folder_get_corresponding_file (folder));
+-              exo_job_launch (EXO_JOB (store->recursive_search_job));
+ 
+               g_signal_connect (store->recursive_search_job, "error", G_CALLBACK (thunar_list_model_search_error), NULL);
+               g_signal_connect (store->recursive_search_job, "finished", G_CALLBACK (thunar_list_model_search_finished), store);
+ 
+-              /* add new results to the model every X ms */
+-              store->update_search_results_timeout_id = g_timeout_add (500, thunar_list_model_add_search_files, store);
++              store->search_job_launch_timeout_id = g_timeout_add (THUNAR_SEARCH_START_DELAY, thunar_list_model_launch_search_job, store);
+             }
+           g_free (search_query_c);
+           files = NULL;
